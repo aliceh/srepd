@@ -3,7 +3,7 @@ package tui
 import "github.com/charmbracelet/bubbles/key"
 
 func (k keymap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Help, k.Quit}
+	return []key.Binding{k.Help, k.Back, k.Quit}
 }
 
 func (k keymap) FullHelp() [][]key.Binding {
@@ -54,8 +54,8 @@ var defaultKeyMap = keymap{
 		key.WithHelp("G", "jump to bottom"),
 	),
 	Quit: key.NewBinding(
-		key.WithKeys("q", "ctrl+c"),
-		key.WithHelp("q/ctrl+c", "quit"),
+		key.WithKeys("ctrl+q", "ctrl+c"),
+		key.WithHelp("ctrl+q/ctrl+c", "quit"),
 	),
 	Help: key.NewBinding(
 		key.WithKeys("h"),
@@ -82,8 +82,8 @@ var defaultKeyMap = keymap{
 		key.WithHelp("n", "add [n]ote"),
 	),
 	Silence: key.NewBinding(
-		key.WithKeys("s"),
-		key.WithHelp("s", "silence"),
+		key.WithKeys("ctrl+s"),
+		key.WithHelp("ctrl+s", "silence"),
 	),
 	Ack: key.NewBinding(
 		key.WithKeys("a"),
@@ -100,5 +100,16 @@ var defaultKeyMap = keymap{
 	Open: key.NewBinding(
 		key.WithKeys("o"),
 		key.WithHelp("o", "open in browser"),
+	),
+}
+
+var errorViewKeyMap = keymap{
+	Quit: key.NewBinding(
+		key.WithKeys("q", "ctrl+c"),
+		key.WithHelp("q/ctrl+c", "quit"),
+	),
+	Back: key.NewBinding(
+		key.WithKeys("esc"),
+		key.WithHelp("esc", "back"),
 	),
 }

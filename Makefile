@@ -8,7 +8,8 @@ GOPATH := $(shell go env GOPATH)
 HOME?=$(shell mktemp -d)
 
 GOLANGCI_LINT_VERSION=v1.51.2
-GORELEASER_VERSION=v1.14.1
+GORELEASER_VERSION=v1.24.0
+export GITHUB_TOKEN?=$(shell jq -r .goreleaser_token ~/.config/goreleaser/goreleaser_token)
 
 # Ensure go modules are enabled:
 export GO111MODULE=on
@@ -16,6 +17,7 @@ export GOPROXY=https://proxy.golang.org
 
 # Disable CGO so that we always generate static binaries:
 export CGO_ENABLED=0
+
 
 .PHONY: build
 build:
@@ -54,7 +56,7 @@ ensure-goreleaser:
 	@ls $(GOPATH)/bin/goreleaser 1>/dev/null || go install github.com/goreleaser/goreleaser@${GORELEASER_VERSION}
 
 release: ensure-goreleaser
-	goreleaser release --rm-dist
+	goreleaser release --clean
 
 .PHONY: fmt
 fmt:
@@ -63,9 +65,7 @@ fmt:
 .PHONY: clean
 clean:
 	rm -rf \
-		build/*-darwin-amd64 \
-		build/*-linux-amd64 \
-		build/*-windows-amd64 \
-		build/*.sha256 \
-		$(NULL)
+		build/*
 
+	rm -rf \
+		dist/*

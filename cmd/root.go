@@ -26,8 +26,12 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
+	"strconv"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/clcollins/srepd/pkg/deprecation"
 	"github.com/clcollins/srepd/pkg/tui"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -59,12 +63,30 @@ but rather a simple tool to make on-call tasks easier.`,
 
 		if viper.GetBool("debug") {
 			log.Printf("Debugging enabled\n")
-			for k, v := range viper.GetViper().AllSettings() {
-				if k == "token" {
+			settings := viper.GetViper().AllSettings()
+			keys := make([]string, 0, len(settings))
+			for k := range settings {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+
+			for _, k := range keys {
+				if deprecation.Deprecated(k) {
+					log.Printf("Found deprecated key: `%v`; you may remove this from your config.", k)
+					continue
+				}
+
+				var v string
+
+				v = fmt.Sprintf("%v", settings[k])
+				if strings.Contains(k, "token") {
 					v = "*****"
 				}
+
 				log.Printf("Found key: `%v`, value: `%v`\n", k, v)
+
 			}
+
 		}
 
 		m, _ := tui.InitialModel(
@@ -76,15 +98,16 @@ but rather a simple tool to make on-call tasks easier.`,
 			viper.GetStringSlice("editor"),
 			tui.ClusterLauncher{
 				Terminal:            viper.GetStringSlice("terminal"),
-				Shell:               viper.GetStringSlice("shell"),
 				ClusterLoginCommand: viper.GetStringSlice("cluster_login_command"),
+				// DEPRECATING SHELL: Shell:               viper.GetStringSlice("shell"),
 			},
 		)
 
 		p := tea.NewProgram(m, tea.WithAltScreen())
 		_, err = p.Run()
 		if err != nil {
-			log.Fatal(err)
+			fmt.Println("fatal:", err)
+			os.Exit(1)
 		}
 	},
 }
@@ -103,25 +126,54 @@ func bindArgsToViper(cmd *cobra.Command) {
 	viper.BindPFlag("debug", cmd.Flags().Lookup("debug"))
 	viper.BindPFlag("editor", cmd.Flags().Lookup("editor"))
 	viper.BindPFlag("terminal", cmd.Flags().Lookup("terminal"))
-	viper.BindPFlag("shell", cmd.Flags().Lookup("shell"))
+	// DEPRECATING SHELL: viper.BindPFlag("shell", cmd.Flags().Lookup("shell"))
 	viper.BindPFlag("cluster_login_command", cmd.Flags().Lookup("clusterLoginCommand"))
+}
+
+type cliFlag struct {
+	flagType  string
+	name      string
+	shorthand string
+	value     string
+	usage     string
+}
+
+func (f cliFlag) StringValue() string {
+	return f.value
+}
+
+func (f cliFlag) BoolValue() bool {
+	b, _ := strconv.ParseBool(f.value)
+	return b
 }
 
 func init() {
 	// Must not be aliases - must be real commands or links
 	const (
-		defaultEditor          = "/usr/bin/vim"
-		defaultTerminal        = "/usr/bin/gnome-terminal"
-		defaultShell           = "/bin/bash"
-		defaultClusterLoginCmd = "/usr/local/bin/ocm backplane login"
+		defaultEditor   = "vim"
+		defaultTerminal = "gnome-terminal"
+		// DEPRECATING SHELL: defaultShell           = "bash -c"
+		defaultClusterLoginCmd = "ocm backplane login"
 	)
 
+	var flags = []cliFlag{
+		{"bool", "debug", "d", "false", "Enable debug logging (~/.config/srepd/debug.log)"},
+		{"string", "editor", "e", defaultEditor, "Editor to use for notes"},
+		{"string", "terminal", "t", defaultTerminal, "Terminal to use for exec commands"},
+		// DEPRECATING SHELL: {"string", "shell", "s", defaultShell, "Shell to use for exec commands"},
+		{"string", "clusterLoginCmd", "c", defaultClusterLoginCmd, "Cluster login command"},
+	}
+
 	cobra.OnInitialize(initConfig)
-	rootCmd.Flags().BoolP("debug", "d", false, "Enable debug logging (~/.config/srepd/debug.log)")
-	rootCmd.Flags().StringP("editor", "e", defaultEditor, "Editor to use for notes; $EDITOR takes precedence")
-	rootCmd.Flags().StringP("terminal", "t", defaultTerminal, "Terminal to use for exec commands")
-	rootCmd.Flags().StringP("shell", "s", defaultShell, "Shell to use for exec commands; $SHELL takes precedence")
-	rootCmd.Flags().StringP("clusterLoginCmd", "c", defaultClusterLoginCmd, "Cluster login command")
+
+	for _, f := range flags {
+		switch f.flagType {
+		case "bool":
+			rootCmd.Flags().BoolP(f.name, f.shorthand, f.BoolValue(), f.usage)
+		case "string":
+			rootCmd.Flags().StringP(f.name, f.shorthand, f.StringValue(), f.usage)
+		}
+	}
 }
 
 // initConfig reads in config file and ENV variables if set.
@@ -139,7 +191,9 @@ func initConfig() {
 	viper.AddConfigPath(home + "/" + cfgFilePath)
 	viper.SetConfigName(cfgFile)
 	viper.SetConfigType("yaml")
-	viper.AutomaticEnv() // read in environment variables that match
+
+	viper.SetEnvPrefix("srepd")
+	viper.AutomaticEnv()
 
 	// If a config file is found, read it in.
 	if err := viper.ReadInConfig(); err != nil {

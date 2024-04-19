@@ -2,143 +2,29 @@ package tui
 
 import (
 	"fmt"
-	"log"
+	"strings"
 	"time"
 
 	"github.com/PagerDuty/go-pagerduty"
-	"github.com/charmbracelet/bubbles/help"
-	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/table"
-	"github.com/charmbracelet/bubbles/textinput"
-	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/clcollins/srepd/pkg/pd"
 )
 
-var debugLogging = false
+const (
+	waitTime           = time.Millisecond * 1
+	defaultInputPrompt = " $ "
+	u
+	nilNoteErr     = "incident note content is empty"
+	nilIncidentErr = "no incident selected"
+)
 
-const waitTime = time.Millisecond * 1
-const defaultInputPrompt = " $ "
-
-func debug(msg ...string) {
-	if !debugLogging {
-		return
-	}
-	log.Printf("%s\n", msg)
-}
-
-func (m *model) setStatus(msg string) {
-	var d []string
-
-	m.status = fmt.Sprint(msg)
-
-	d = append(d, "setStatus")
-	d = append(d, msg)
-
-	log.Printf("%s\n", d)
-}
-
-// TODO https://github.com/clcollins/srepd/issues/3 - not handling error messages properly
 type errMsg struct{ error }
-
-type model struct {
-	err error
-
-	config   *pd.Config
-	editor   []string
-	launcher ClusterLauncher
-
-	table table.Model
-	input textinput.Model
-	// This is a hack since viewport.Model doesn't have a Focused() method
-	viewingIncident bool
-	incidentViewer  viewport.Model
-	help            help.Model
-
-	status string
-
-	incidentList           []pagerduty.Incident
-	selectedIncident       *pagerduty.Incident
-	selectedIncidentNotes  []pagerduty.IncidentNote
-	selectedIncidentAlerts []pagerduty.IncidentAlert
-
-	teamMode bool
-}
-
-func newTableWithStyles() table.Model {
-	debug("newTableWithStyles")
-	t := table.New(table.WithFocused(true))
-	t.SetStyles(tableStyle)
-	return t
-}
-
-func newTextInput() textinput.Model {
-	debug("newTextInput")
-	i := textinput.New()
-	i.Prompt = " $ "
-	i.CharLimit = 32
-	i.Width = 50
-	return i
-}
-
-func newHelp() help.Model {
-	debug("newHelp")
-	h := help.New()
-	h.ShowAll = false
-	return h
-}
-
-func newIncidentViewer() viewport.Model {
-	debug("newIncidentViewer")
-	vp := viewport.New(100, 100)
-	vp.Style = incidentViewerStyle
-	return vp
-}
-
-func InitialModel(
-	// "d" is to avoid a conflict with the "debug" function
-	d bool,
-	token string,
-	teams []string,
-	user string,
-	ignoredusers []string,
-	editor []string,
-	launcher ClusterLauncher,
-) (tea.Model, tea.Cmd) {
-	if d {
-		debugLogging = true
-	}
-
-	debug("InitialModel")
-	var err error
-
-	m := model{
-		editor:   editor,
-		launcher: launcher,
-		help:     newHelp(),
-		table:    newTableWithStyles(),
-		input:    newTextInput(),
-		// INCIDENTVIEWER
-		incidentViewer: newIncidentViewer(),
-		status:         "",
-	}
-
-	// This is an ugly way to handle this error
-	// TODO: Turn this into an error message window view on failure instead of a panic
-	pd, err := pd.NewConfig(token, teams, user, ignoredusers)
-	if err != nil {
-		log.Fatal(err)
-		panic(err)
-	}
-	m.config = pd
-
-	return m, func() tea.Msg {
-		return errMsg{err}
-	}
-}
 
 func (m model) Init() tea.Cmd {
 	debug("Init")
+	if m.err != nil {
+		return func() tea.Msg { return errMsg{m.err} }
+	}
 	return func() tea.Msg { return updateIncidentListMsg("sender: Init") }
 }
 
@@ -149,51 +35,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 
 	case errMsg:
-		debug("errMsg")
-		m.setStatus(msg.Error())
-		m.err = msg
-		log.Fatal(m.err)
-		return m, nil
+		m.Init()
+		return m.errMsgHandler(msg)
 
 	case tea.WindowSizeMsg:
-		debug("tea.WindowSizeMsg")
-		windowSize = msg
-		top, _, bottom, _ := mainStyle.GetMargin()
-		eighthWindow := windowSize.Width / 8
-		cellPadding := (horizontalPadding * 2) * 4
-		borderEdges := 2 + 10
-
-		m.help.Width = windowSize.Width - borderEdges
-
-		m.table.SetColumns([]table.Column{
-			{Title: dot, Width: 1},
-			{Title: "ID", Width: eighthWindow + cellPadding - borderEdges},
-			{Title: "Summary", Width: eighthWindow * 3},
-			{Title: "Service", Width: eighthWindow * 3},
-		})
-
-		height := windowSize.Height - top - bottom - 10
-
-		m.table.SetHeight(height)
-
-		m.incidentViewer.Width = windowSize.Width - borderEdges
-		m.incidentViewer.Height = height
+		return m.windowSizeMsgHandler(msg)
 
 	case tea.KeyMsg:
-		debug("tea.KeyMsg", fmt.Sprint(msg))
-		if key.Matches(msg, defaultKeyMap.Quit) {
-			return m, tea.Quit
-		}
-
-		// Default commands for the table view
-		switch {
-		case m.viewingIncident:
-			return switchIncidentFocusMode(m, msg)
-		case m.input.Focused():
-			return switchInputFocusMode(m, msg)
-		case m.table.Focused():
-			return switchTableFocusMode(m, msg)
-		}
+		return m.keyMsgHandler(msg)
 
 	// Command to get an incident by ID
 	case getIncidentMsg:
@@ -203,12 +52,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// Set the selected incident to the incident returned from the getIncident command
 	case gotIncidentMsg:
-		debug("gotIncidentMsg", "TRUNCATED")
 		if msg.err != nil {
-			m.setStatus(msg.err.Error())
-			log.Fatal(msg.err)
-			return m, nil
+			return m, func() tea.Msg { return errMsg{msg.err} }
 		}
+
+		debug("gotIncidentMsg", msg.incident.ID)
 
 		m.setStatus(fmt.Sprintf("got incident %s", msg.incident.ID))
 		m.selectedIncident = msg.incident
@@ -218,32 +66,58 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		)
 
 	case gotIncidentNotesMsg:
-		debug("gotIncidentNotesMsg", "TRUNCATED")
 		if msg.err != nil {
-			m.setStatus(msg.err.Error())
-			log.Fatal(msg.err)
-			return m, nil
+			return m, func() tea.Msg { return errMsg{msg.err} }
 		}
+
+		getIDs := func(x []pagerduty.IncidentNote) []string {
+			var ids []string
+			for _, n := range x {
+				ids = append(ids, n.ID)
+			}
+			return ids
+		}
+
+		debug("gotIncidentNotesMsg", strings.Join(getIDs(msg.notes), ", "))
 
 		// CANNOT refer to the m.SelectedIncident, because it may not have
 		// completed yet, and will be nil
-		m.setStatus(fmt.Sprintf("got %d notes for incident", len(msg.notes)))
+		switch {
+		case len(msg.notes) == 1:
+			m.setStatus(fmt.Sprintf("got %d note for incident", len(msg.notes)))
+		case len(msg.notes) > 1:
+			m.setStatus(fmt.Sprintf("got %d notes for incident", len(msg.notes)))
+		}
+
 		m.selectedIncidentNotes = msg.notes
 		if m.viewingIncident {
 			cmds = append(cmds, renderIncident(&m))
 		}
 
 	case gotIncidentAlertsMsg:
-		debug("gotIncidentAlertsMsg", "TRUNCATED")
 		if msg.err != nil {
-			m.setStatus(msg.err.Error())
-			log.Fatal(msg.err)
-			return m, nil
+			return m, func() tea.Msg { return errMsg{msg.err} }
 		}
+
+		getIDs := func(x []pagerduty.IncidentAlert) []string {
+			var ids []string
+			for _, n := range x {
+				ids = append(ids, n.ID)
+			}
+			return ids
+		}
+
+		debug("gotIncidentAlertsMsg", strings.Join(getIDs(msg.alerts), ", "))
 
 		// CANNOT refer to the m.SelectedIncident, because it may not have
 		// completed yet, and will be nil
-		m.setStatus(fmt.Sprintf("got %d alerts for incident", len(msg.alerts)))
+		switch {
+		case len(msg.alerts) == 1:
+			m.setStatus(fmt.Sprintf("got %d alert for incident", len(msg.alerts)))
+		case len(msg.alerts) > 1:
+			m.setStatus(fmt.Sprintf("got %d alerts for incident", len(msg.alerts)))
+		}
+
 		m.selectedIncidentAlerts = msg.alerts
 		if m.viewingIncident {
 			cmds = append(cmds, renderIncident(&m))
@@ -256,38 +130,38 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, updateIncidentList(m.config))
 
 	case updatedIncidentListMsg:
-		debug("updatedIncidentListMsg", "TRUNCATED")
 		if msg.err != nil {
-			m.setStatus(msg.err.Error())
-			log.Fatal(msg.err)
-			return m, nil
+			return m, func() tea.Msg { return errMsg{msg.err} }
 		}
-		m.incidentList = msg.incidents
-		var ignoredUsersList []string
 
-		for _, i := range m.config.IgnoredUsers {
-			ignoredUsersList = append(ignoredUsersList, i.ID)
+		getIDs := func(x []pagerduty.Incident) []string {
+			var ids []string
+			for _, n := range x {
+				ids = append(ids, n.ID)
+			}
+			return ids
 		}
+
+		debug("updatedIncidentListMsg", strings.Join(getIDs(msg.incidents), ", "))
+
+		m.incidentList = msg.incidents
 
 		var totalIncidentCount int
 		var rows []table.Row
 
 		for _, i := range msg.incidents {
-			// If the incident is not AssignedToAnyUsers in the ignoredUsersList, add it to the table
-			if !AssignedToAnyUsers(i, ignoredUsersList) {
-
-				totalIncidentCount++
-				if m.teamMode {
+			totalIncidentCount++
+			if m.teamMode {
+				rows = append(rows, table.Row{acknowledged(i.Acknowledgements), i.ID, i.Title, i.Service.Summary})
+			} else {
+				if AssignedToUser(i, m.config.CurrentUser.ID) {
 					rows = append(rows, table.Row{acknowledged(i.Acknowledgements), i.ID, i.Title, i.Service.Summary})
-				} else {
-					if AssignedToUser(i, m.config.CurrentUser.ID) {
-						rows = append(rows, table.Row{acknowledged(i.Acknowledgements), i.ID, i.Title, i.Service.Summary})
-					}
 				}
 			}
 		}
 
 		m.table.SetRows(rows)
+
 		if totalIncidentCount == 1 {
 			m.setStatus(fmt.Sprintf("showing %d/%d incident...", len(m.table.Rows()), totalIncidentCount))
 		} else {
@@ -295,12 +169,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case editorFinishedMsg:
-		debug("editorFinishedMsg", fmt.Sprint(msg))
 		if msg.err != nil {
-			m.setStatus(msg.err.Error())
-			log.Fatal(msg.err)
-			return m, nil
+			return m, func() tea.Msg { return errMsg{msg.err} }
 		}
+
+		debug("editorFinishedMsg", fmt.Sprint(msg))
 
 		if m.selectedIncident == nil {
 			m.setStatus("failed to add note - no selected incident")
@@ -311,6 +184,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// Refresh the local copy of the incident after the note is added
 	case addedIncidentNoteMsg:
+		if msg.err != nil {
+			if msg.err.Error() == nilNoteErr {
+				m.status = "skipping adding empty note to incident"
+				return m, nil
+			}
+			return m, func() tea.Msg { return errMsg{msg.err} }
+		}
+
 		debug("addedIncidentNoteMsg", fmt.Sprint(msg))
 
 		if m.selectedIncident == nil {
@@ -334,12 +215,36 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// TODO https://github.com/clcollins/srepd/issues/1: Figure out how to prompt with list to select from
 		cluster := getDetailFieldFromAlert("cluster_id", m.selectedIncidentAlerts[0])
+		debug(cluster)
 		m.setStatus(fmt.Sprintf("multiple alerts for incident - logging into cluster %s from first alert %s", cluster, m.selectedIncidentAlerts[0].ID))
 		return m, func() tea.Msg { return login(cluster, m.launcher) }
 
+	case loginFinishedMsg:
+		if msg.err != nil {
+			return m, func() tea.Msg { return errMsg{msg.err} }
+		}
+
+	case openBrowserMsg:
+		debug("openBrowserMsg", fmt.Sprint(msg))
+		if defaultBrowserOpenCommand == "" {
+			return m, func() tea.Msg { return errMsg{fmt.Errorf("unsupported OS: no browser open command available")} }
+		}
+		c := []string{defaultBrowserOpenCommand}
+		return m, func() tea.Msg { return openBrowserCmd(c, m.selectedIncident.HTMLURL) }
+
+	case browserFinishedMsg:
+		if msg.err != nil {
+			return m, func() tea.Msg { return errMsg{msg.err} }
+		} else {
+			m.setStatus(fmt.Sprintf("opened incident %s in browser - check browser window", m.selectedIncident.ID))
+			return m, nil
+		}
+
+	// This is a catch all for any action that requires a selected incident
+	//
 	case waitForSelectedIncidentThenDoMsg:
-		debug("waitForSelectedIncidentThenDoMsg", fmt.Sprint(msg.action, msg.msg))
-		if msg.action == "" {
+		debug("waitForSelectedIncidentThenDoMsg: ", fmt.Sprintf("action: %+v, msg: %+v", msg.action, msg.msg))
+		if msg.action == nil {
 			m.setStatus("failed to perform action: no action included in msg")
 			return m, nil
 		}
@@ -351,36 +256,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.selectedIncident == nil {
 			time.Sleep(waitTime)
 			m.setStatus("waiting for incident info...")
-			return m, func() tea.Msg { return waitForSelectedIncidentThenDoMsg(msg) }
+			return m, func() tea.Msg { return waitForSelectedIncidentThenDoMsg{action: msg.action, msg: msg.msg} }
 		}
 
-		// TODO https://github.com/clcollins/srepd/issues/2: Figure out how to use an interface for the msg.action to write this once
-		// cmds = append(cmds, func() tea.Msg { return msg.action(msg.msg) })
-
-		switch msg.action {
-		// TODO https://github.com/clcollins/srepd/issues/2: See TODO above
-		// case "acknowledgeIncidentsMsg":
-		// 	if msg.msg.incidents == nil {
-		// 		m.setStatus("failed acknowledging incidents - no incidents provided")
-		// 		return m, nil
-		// 	}
-
-		// 	return m, tea.Sequence(
-		// 		acknowledgeIncidents(m.config, msg.incidents),
-		// 		func() tea.Msg { return clearSelectedIncidentsMsg("sender: acknowledgeIncidentsMsg") },
-		// 	)
-		// case "annotateIncidentsMsg":
-		// TODO: The "ACTION" here needs to be a tea.Msg, not a string
-		case "loginMsg":
-			return m, func() tea.Msg { return loginMsg("login") }
-		// case "reassignIncidentsMsg":
-		case "renderIncidentMsg":
-			return m, func() tea.Msg { return renderIncidentMsg("render") }
-		// case "silenceIncidentsMsg":
-		default:
-			debug(fmt.Sprintf("%v not implemented", msg.action))
-			return m, nil
-		}
+		debug("Trying to do action")
+		cmds = append(cmds, msg.action)
 
 	case renderIncidentMsg:
 		debug("renderIncidentMsg", fmt.Sprint(msg))
@@ -392,21 +272,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, renderIncident(&m))
 
 	case renderedIncidentMsg:
-		debug("renderedIncidentMsg", fmt.Sprint(msg))
-		// TODO https://github.com/clcollins/srepd/issues/3 - check the msg.err properly
-		// not in the renderIncident() function
+		if msg.err != nil {
+			return m, func() tea.Msg { return errMsg{msg.err} }
+		}
+		debug("renderedIncidentMsg")
 		m.incidentViewer.SetContent(msg.content)
 		m.viewingIncident = true
-
-	case waitForSelectedIncidentsThenAnnotateMsg:
-		debug("waitForSelectedIncidentsThenAnnotateMsg", fmt.Sprint(msg))
-		if m.selectedIncident == nil {
-			time.Sleep(waitTime)
-			m.setStatus("waiting for incident info...")
-			return m, func() tea.Msg { return waitForSelectedIncidentsThenAnnotateMsg(msg) }
-		}
-		// TODO - https://github.com/clcollins/srepd/issues/2: This needs to be a tea.Cmd to allow waitForSelectedIncidentsThenDo
-		cmds = append(cmds, openEditorCmd(m.editor))
 
 	case acknowledgeIncidentsMsg:
 		debug("acknowledgeIncidentsMsg", fmt.Sprint(msg))
@@ -421,6 +292,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		)
 
 	case acknowledgedIncidentsMsg:
+		if msg.err != nil {
+			return m, func() tea.Msg { return errMsg{msg.err} }
+		}
 		debug("acknowledgedIncidentsMsg", fmt.Sprint(msg))
 		m.setStatus(fmt.Sprintf("acknowledged incidents %v; refreshing Incident List ", msg))
 		return m, func() tea.Msg { return updateIncidentListMsg("sender: acknowledgedIncidentsMsg") }
@@ -453,9 +327,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.setStatus(fmt.Sprintf("reassigned incidents %v; refreshing Incident List ", msg))
 		return m, func() tea.Msg { return updateIncidentListMsg("sender: reassignedIncidentsMsg") }
 
+	case silenceSelectedIncidentMsg:
+		if m.selectedIncident == nil {
+			return m, func() tea.Msg {
+				return waitForSelectedIncidentThenDoMsg{
+					msg:    "silence",
+					action: func() tea.Msg { return silenceSelectedIncidentMsg{} },
+				}
+			}
+		}
+
+		return m, tea.Sequence(
+			silenceIncidents([]*pagerduty.Incident{m.selectedIncident}, []*pagerduty.User{m.config.SilentUser}),
+			func() tea.Msg { return clearSelectedIncidentsMsg("sender: silenceSelectedIncidentMsg") },
+		)
+
 	case silenceIncidentsMsg:
-		debug("silenceIncidentsMsg", fmt.Sprint(msg))
-		if (msg.incidents == nil) && (m.selectedIncident == nil) {
+		debug("silenceIncidentsMsg", fmt.Sprintf("%+v", msg))
+		if msg.incidents == nil {
 			m.setStatus("failed silencing incidents - no incidents provided")
 			return m, nil
 		}
@@ -469,17 +358,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			func() tea.Msg { return clearSelectedIncidentsMsg("sender: silenceIncidentsMsg") },
 		)
 
-	// There is no "silencedIncidentsMsg" - silences are really reassignments under the hood
-
-	case waitForSelectedIncidentsThenSilenceMsg:
-		debug("waitForSelectedIncidentsThenSilenceMsg", fmt.Sprint(msg))
-		if m.selectedIncident == nil {
-			time.Sleep(waitTime)
-			m.setStatus("waiting for incident info...")
-			return m, func() tea.Msg { return waitForSelectedIncidentsThenSilenceMsg(msg) }
-		}
-		return m, func() tea.Msg { return silenceIncidentsMsg{incidents: []*pagerduty.Incident{m.selectedIncident}} }
-
 	case clearSelectedIncidentsMsg:
 		debug("clearSelectedIncidentsMsg", fmt.Sprint(msg))
 		m.viewingIncident = false
@@ -491,163 +369,4 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	return m, tea.Batch(cmds...)
 
-}
-
-func (m model) View() string {
-	debug("View")
-	helpView := helpStyle.Render(m.help.View(defaultKeyMap))
-
-	switch {
-	case m.err != nil:
-		debug("error")
-		return fmt.Sprintf("ERROR: %s\n", m.err.Error())
-
-	case m.viewingIncident:
-		debug("viewingIncident")
-		return mainStyle.Render(m.renderHeader() + "\n" + m.incidentViewer.View() + "\n" + helpView)
-	default:
-		tableView := tableContainerStyle.Render(m.table.View())
-		if m.input.Focused() {
-			debug("viewingTable and input")
-			return mainStyle.Render(m.renderHeader() + "\n" + tableView + "\n" + m.input.View() + "\n" + helpView)
-		}
-		debug("viewingTable")
-		return mainStyle.Render(m.renderHeader() + "\n" + tableView + "\n" + helpView)
-	}
-}
-
-// tableFocusMode is the main mode for the application
-func switchTableFocusMode(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
-	debug("switchTableFocusMode")
-	var cmds []tea.Cmd
-
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch {
-		case key.Matches(msg, defaultKeyMap.Help):
-			m.help.ShowAll = !m.help.ShowAll
-
-		case key.Matches(msg, defaultKeyMap.Up):
-			m.table.MoveUp(1)
-
-		case key.Matches(msg, defaultKeyMap.Down):
-			m.table.MoveDown(1)
-
-		case key.Matches(msg, defaultKeyMap.Top):
-			m.table.GotoTop()
-
-		case key.Matches(msg, defaultKeyMap.Bottom):
-			m.table.GotoBottom()
-
-		case key.Matches(msg, defaultKeyMap.Enter):
-			m.viewingIncident = true
-			return m, tea.Sequence(
-				func() tea.Msg { return getIncidentMsg(m.table.SelectedRow()[1]) },
-				func() tea.Msg { return waitForSelectedIncidentThenDoMsg{action: "renderIncidentMsg", msg: "render"} },
-			)
-
-		case key.Matches(msg, defaultKeyMap.Team):
-			m.teamMode = !m.teamMode
-			cmds = append(cmds, func() tea.Msg { return updatedIncidentListMsg{m.incidentList, nil} })
-
-		case key.Matches(msg, defaultKeyMap.Refresh):
-			m.setStatus(loadingIncidentsStatus)
-			cmds = append(cmds, updateIncidentList(m.config))
-
-		// In table mode, highlighted incidents are not selected yet, so they need to be retrieved
-		// and then can be acted upon.  Since tea.Sequence does not wait for completion, the
-		// "waitForSelectedIncidentsThen..." functions are used to wait for the selected incident
-		// to be retrieved from PagerDuty
-		case key.Matches(msg, defaultKeyMap.Silence):
-			return m, tea.Sequence(
-				func() tea.Msg { return getIncidentMsg(m.table.SelectedRow()[1]) },
-				func() tea.Msg { return waitForSelectedIncidentsThenSilenceMsg("wait") },
-			)
-
-		case key.Matches(msg, defaultKeyMap.Ack):
-			return m, tea.Sequence(
-				func() tea.Msg { return getIncidentMsg(m.table.SelectedRow()[1]) },
-				func() tea.Msg { return waitForSelectedIncidentsThenAcknowledgeMsg("wait") },
-			)
-
-		case key.Matches(msg, defaultKeyMap.Note):
-			return m, tea.Sequence(
-				func() tea.Msg { return getIncidentMsg(m.table.SelectedRow()[1]) },
-				func() tea.Msg { return waitForSelectedIncidentsThenAnnotateMsg("wait") },
-			)
-
-		case key.Matches(msg, defaultKeyMap.Login):
-			return m, tea.Sequence(
-				func() tea.Msg { return getIncidentMsg(m.table.SelectedRow()[1]) },
-				func() tea.Msg { return waitForSelectedIncidentThenDoMsg{action: "loginMsg", msg: "wait"} },
-			)
-
-		case key.Matches(msg, defaultKeyMap.Input):
-			return m, tea.Sequence(
-				m.input.Focus(),
-			)
-		}
-	}
-	return m, tea.Batch(cmds...)
-}
-
-func switchInputFocusMode(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
-	debug("switchInputFocusMode")
-	var cmds []tea.Cmd
-
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch {
-		case key.Matches(msg, defaultKeyMap.Back):
-			m.input.Blur()
-			m.table.Focus()
-			m.input.Prompt = defaultInputPrompt
-			return m, nil
-
-		case key.Matches(msg, defaultKeyMap.Enter):
-
-		}
-	}
-	return m, tea.Batch(cmds...)
-}
-
-func switchIncidentFocusMode(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
-	debug("switchIncidentFocusMode")
-	var cmd tea.Cmd
-	var cmds []tea.Cmd
-
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch {
-		// This un-sets the selected incident and returns to the table view
-		case key.Matches(msg, defaultKeyMap.Back):
-			m.viewingIncident = false
-			m.selectedIncident = nil
-			m.selectedIncidentAlerts = nil
-			m.selectedIncidentNotes = nil
-
-		case key.Matches(msg, defaultKeyMap.Ack):
-			return m, func() tea.Msg { return acknowledgeIncidentsMsg{incidents: []*pagerduty.Incident{m.selectedIncident}} }
-
-		case key.Matches(msg, defaultKeyMap.Silence):
-			return m, func() tea.Msg { return silenceIncidentsMsg{incidents: []*pagerduty.Incident{m.selectedIncident}} }
-
-		case key.Matches(msg, defaultKeyMap.Note):
-			cmds = append(cmds, openEditorCmd(m.editor))
-
-		case key.Matches(msg, defaultKeyMap.Refresh):
-			return m, func() tea.Msg { return getIncidentMsg(m.selectedIncident.ID) }
-
-		case key.Matches(msg, defaultKeyMap.Login):
-			return m, tea.Sequence(
-				func() tea.Msg { return getIncidentMsg(m.table.SelectedRow()[1]) },
-				func() tea.Msg { return waitForSelectedIncidentThenDoMsg{action: "loginMsg", msg: "wait"} },
-			)
-		}
-	}
-
-	m.incidentViewer, cmd = m.incidentViewer.Update(msg)
-	cmds = append(cmds, cmd)
-
-	return m, tea.Batch(cmds...)
 }

@@ -8,10 +8,10 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"slices"
 
 	"github.com/PagerDuty/go-pagerduty"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/glamour"
 	"github.com/clcollins/srepd/pkg/pd"
 )
 
@@ -21,29 +21,12 @@ const (
 )
 
 type waitForSelectedIncidentThenDoMsg struct {
-	action string
+	action tea.Cmd
 	msg    tea.Msg
 }
 
 //lint:ignore U1000 - future proofing
 type waitForSelectedIncidentThenRenderMsg string
-
-func renderIncidentMarkdown(content string) (string, error) {
-	renderer, err := glamour.NewTermRenderer(
-		glamour.WithAutoStyle(),
-		glamour.WithWordWrap(windowSize.Width),
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	str, err := renderer.Render(content)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	return str, nil
-}
 
 //lint:ignore U1000 - future proofing
 func updateSelectedIncident(p *pd.Config, id string) tea.Cmd {
@@ -61,11 +44,33 @@ type updatedIncidentListMsg struct {
 }
 
 func updateIncidentList(p *pd.Config) tea.Cmd {
-	debug("updateIncidentList")
 	return func() tea.Msg {
 		opts := pd.NewListIncidentOptsFromDefaults()
 		opts.TeamIDs = getTeamsAsStrings(p)
+
+		// Convert the list of *pagerduty.User to a slice of user IDs
+		ignoredUserIDs := func(u []*pagerduty.User) []string {
+			var l []string
+			for _, i := range u {
+				l = append(l, i.ID)
+			}
+			return l
+		}(p.IgnoredUsers)
+
+		// If the UserID from p.TeamMemberIDs is not in the ignoredUserIDs slice, add it to the opts.UserIDs slice
+		opts.UserIDs = func(a []string, i []string) []string {
+			var l []string
+			for _, u := range a {
+				if !slices.Contains(i, u) {
+					l = append(l, u)
+				}
+			}
+			return l
+		}(p.TeamsMemberIDs, ignoredUserIDs)
+
+		// Retrieve incidents assigned to the TeamIDs and filtered UserIDs
 		i, err := pd.GetIncidents(p.Client, opts)
+		debug(fmt.Sprintf("tui.updateIncidentList(): retrieved %v incidents after filtering", len(i)))
 		return updatedIncidentListMsg{i, err}
 	}
 }
@@ -78,12 +83,19 @@ type renderedIncidentMsg struct {
 }
 
 func renderIncident(m *model) tea.Cmd {
-	debug("renderIncident")
 	return func() tea.Msg {
-		content, err := renderIncidentMarkdown(m.template())
+		t, err := m.template()
 		if err != nil {
-			m.setStatus(err.Error())
-			log.Fatal(err)
+			return func() tea.Msg {
+				return errMsg{err}
+			}
+		}
+
+		content, err := renderIncidentMarkdown(t)
+		if err != nil {
+			return func() tea.Msg {
+				return errMsg{err}
+			}
 		}
 
 		return renderedIncidentMsg{content, err}
@@ -97,7 +109,6 @@ type gotIncidentMsg struct {
 }
 
 func getIncident(p *pd.Config, id string) tea.Cmd {
-	debug("getIncident")
 	return func() tea.Msg {
 		ctx := context.Background()
 		i, err := p.Client.GetIncidentWithContext(ctx, id)
@@ -111,7 +122,6 @@ type gotIncidentAlertsMsg struct {
 }
 
 func getIncidentAlerts(p *pd.Config, id string) tea.Cmd {
-	debug("getIncidentAlerts")
 	return func() tea.Msg {
 		a, err := pd.GetAlerts(p.Client, id, pagerduty.ListIncidentAlertsOptions{})
 		return gotIncidentAlertsMsg{a, err}
@@ -125,7 +135,6 @@ type gotIncidentNotesMsg struct {
 
 // getIncidentNotes returns a command that fetches the notes for the given incident
 func getIncidentNotes(p *pd.Config, id string) tea.Cmd {
-	debug("getIncidentNotes")
 	return func() tea.Msg {
 		n, err := pd.GetNotes(p.Client, id)
 		return gotIncidentNotesMsg{n, err}
@@ -134,7 +143,6 @@ func getIncidentNotes(p *pd.Config, id string) tea.Cmd {
 
 // AssignedToAnyUsers returns true if the incident is assigned to any of the given users
 func AssignedToAnyUsers(i pagerduty.Incident, ids []string) bool {
-	debug("AssignedToAnyUsers")
 	for _, a := range i.Assignments {
 		for _, id := range ids {
 			if a.Assignee.ID == id {
@@ -147,7 +155,6 @@ func AssignedToAnyUsers(i pagerduty.Incident, ids []string) bool {
 
 // AssignedToUser returns true if the incident is assigned to the given user
 func AssignedToUser(i pagerduty.Incident, id string) bool {
-	debug("AssignedToUser")
 	for _, a := range i.Assignments {
 		if a.Assignee.ID == id {
 			return true
@@ -156,17 +163,72 @@ func AssignedToUser(i pagerduty.Incident, id string) bool {
 	return false
 }
 
+// TODO: Can we use a single function and struct to handle
+// the openEditorCmd, login and openBrowserCmd commands?
+
+type browserFinishedMsg struct {
+	err error
+}
+type openBrowserMsg string
+
+func openBrowserCmd(browser []string, url string) tea.Cmd {
+	debug("tui.openBrowserCmd(): opening browser")
+	debug(fmt.Sprintf("tui.openBrowserCmd(): %v %v", browser, url))
+
+	var args []string
+	args = append(args, browser[1:]...)
+	args = append(args, url)
+
+	c := exec.Command(browser[0], args...)
+	debug(fmt.Sprintf("tui.openBrowserCmd(): %v", c.String()))
+	stderr, pipeErr := c.StderrPipe()
+	if pipeErr != nil {
+		debug(fmt.Sprintf("tui.openBrowserCmd(): %v", pipeErr.Error()))
+		return func() tea.Msg {
+			return browserFinishedMsg{err: pipeErr}
+		}
+	}
+
+	err := c.Start()
+	if err != nil {
+		debug(fmt.Sprintf("tui.openBrowserCmd(): %v", err.Error()))
+		return func() tea.Msg {
+			return browserFinishedMsg{err}
+		}
+	}
+
+	out, err := io.ReadAll(stderr)
+	if err != nil {
+		debug(fmt.Sprintf("tui.openBrowserCmd(): %v", err.Error()))
+		return func() tea.Msg {
+			return browserFinishedMsg{err}
+		}
+	}
+
+	if len(out) > 0 {
+		debug(fmt.Sprintf("tui.openBrowserCmd(): error: %s", out))
+		return func() tea.Msg {
+			return browserFinishedMsg{fmt.Errorf("%s", out)}
+		}
+	}
+
+	return func() tea.Msg {
+		return browserFinishedMsg{}
+	}
+}
+
 type editorFinishedMsg struct {
 	err  error
 	file *os.File
 }
 
 func openEditorCmd(editor []string) tea.Cmd {
-	debug("openEditorCmd")
+	debug("tui.openEditorCmd(): opening editor")
 	var args []string
 
 	file, err := os.CreateTemp(os.TempDir(), "")
 	if err != nil {
+		debug(fmt.Sprintf("tui.openEditorCmd(): error: %v", err))
 		return func() tea.Msg {
 			return errMsg{error: err}
 		}
@@ -176,50 +238,56 @@ func openEditorCmd(editor []string) tea.Cmd {
 	args = append(args, file.Name())
 
 	c := exec.Command(editor[0], args...)
+
+	debug(fmt.Sprintf("%+v", c))
 	return tea.ExecProcess(c, func(err error) tea.Msg {
+		if err != nil {
+			debug(fmt.Sprintf("tui.openEditorCmd(): error: %v", err))
+			return errMsg{error: err}
+		}
 		return editorFinishedMsg{err, file}
 	})
 }
 
 type loginMsg string
-type loginFinishedMsg error
+type loginFinishedMsg struct {
+	err error
+}
 
 type ClusterLauncher struct {
 	Terminal            []string
-	Shell               []string
 	ClusterLoginCommand []string
+	// DEPRECATING SHELL: Shell               []string
 }
 
 func login(cluster string, launcher ClusterLauncher) tea.Cmd {
-	debug("login")
-
 	// Check if we have the necessary info to try to login
 	errs := []error{}
 	if launcher.Terminal == nil {
-		debug("Terminal is not set")
+		debug("tui.login(): Terminal is not set")
 		errs = append(errs, errors.New("terminal is not set"))
 	}
-	if launcher.Shell == nil {
-		debug("Shell is not set")
-		errs = append(errs, errors.New("shell is not set"))
-	}
+	// DEPRECATING SHELL: if launcher.Shell == nil {
+	// DEPRECATING SHELL: 	debug("tui.login(): Shell is not set")
+	// DEPRECATING SHELL: 	errs = append(errs, errors.New("shell is not set"))
+	// DEPRECATING SHELL: }
 	if launcher.ClusterLoginCommand == nil {
-		debug("ClusterLoginCommand is not set")
+		debug("tui.login(): ClusterLoginCommand is not set")
 		errs = append(errs, errors.New("ClusterLoginCommand is not set"))
 	}
 
 	if len(errs) > 0 {
 		err := fmt.Errorf("login error: %v", errs)
-		debug(err.Error())
+		debug(fmt.Sprintf("tui.login(): %v", err.Error()))
 		return func() tea.Msg {
-			return loginFinishedMsg(err)
+			return loginFinishedMsg{err}
 		}
 	}
 
 	var args []string
 	args = append(args, launcher.Terminal[1:]...)
 	args = append(args, "--") // Terminal separator
-	args = append(args, launcher.Shell...)
+	// DEPRECATING SHELL: args = append(args, launcher.Shell...)
 	args = append(args, launcher.ClusterLoginCommand...)
 	args = append(args, cluster)
 
@@ -227,40 +295,40 @@ func login(cluster string, launcher ClusterLauncher) tea.Cmd {
 	// This handles if folks use, eg: flatpak run <some package> as a terminal.
 	c := exec.Command(launcher.Terminal[0], args...)
 
-	debug(c.String())
+	debug(fmt.Sprintf("tui.login(): %v", c.String()))
 	stderr, pipeErr := c.StderrPipe()
 	if pipeErr != nil {
-		debug(pipeErr.Error())
+		debug(fmt.Sprintf("tui.login(): %v", pipeErr.Error()))
 		return func() tea.Msg {
-			return loginFinishedMsg(pipeErr)
+			return loginFinishedMsg{err: pipeErr}
 		}
 	}
 
 	err := c.Start()
 	if err != nil {
-		debug(err.Error())
+		debug(fmt.Sprintf("tui.login(): %v", err.Error()))
 		return func() tea.Msg {
-			return loginFinishedMsg(err)
+			return loginFinishedMsg{err}
 		}
 	}
 
 	out, err := io.ReadAll(stderr)
 	if err != nil {
-		debug(err.Error())
+		debug(fmt.Sprintf("tui.login(): %v", err.Error()))
 		return func() tea.Msg {
-			return loginFinishedMsg(err)
+			return loginFinishedMsg{err}
 		}
 	}
 
 	if len(out) > 0 {
-		debug(fmt.Sprintf("login error: %s", out))
+		debug(fmt.Sprintf("tui.login(): error: %s", out))
 		return func() tea.Msg {
-			return loginFinishedMsg(fmt.Errorf("%s", out))
+			return loginFinishedMsg{fmt.Errorf("%s", out)}
 		}
 	}
 
 	return func() tea.Msg {
-		return loginFinishedMsg(nil)
+		return loginFinishedMsg{err}
 	}
 }
 
@@ -277,7 +345,6 @@ type acknowledgedIncidentsMsg struct {
 type waitForSelectedIncidentsThenAcknowledgeMsg string
 
 func acknowledgeIncidents(p *pd.Config, incidents []*pagerduty.Incident) tea.Cmd {
-	debug("acknowledgeIncidents")
 	return func() tea.Msg {
 		u, err := p.Client.GetCurrentUserWithContext(context.Background(), pagerduty.GetCurrentUserOptions{})
 		if err != nil {
@@ -298,7 +365,6 @@ type reassignIncidentsMsg struct {
 type reassignedIncidentsMsg []pagerduty.Incident
 
 func reassignIncidents(p *pd.Config, i []*pagerduty.Incident, users []*pagerduty.User) tea.Cmd {
-	debug("reassignIncidents")
 	return func() tea.Msg {
 		u, err := p.Client.GetCurrentUserWithContext(context.Background(), pagerduty.GetCurrentUserOptions{})
 		if err != nil {
@@ -312,15 +378,14 @@ func reassignIncidents(p *pd.Config, i []*pagerduty.Incident, users []*pagerduty
 	}
 }
 
+type silenceSelectedIncidentMsg struct{}
 type silenceIncidentsMsg struct {
 	incidents []*pagerduty.Incident
 }
-type waitForSelectedIncidentsThenSilenceMsg string
 
 var errSilenceIncidentInvalidArgs = errors.New("silenceIncidents: invalid arguments")
 
 func silenceIncidents(i []*pagerduty.Incident, u []*pagerduty.User) tea.Cmd {
-	debug("silenceIncidents")
 	// SilenceIncidents doesn't have it's own "silencedIncidentsMessage"
 	// because it's really just a reassignment
 	log.Printf("silence requested for incident(s) %v; reassigning to %v", i, u)
@@ -334,14 +399,12 @@ func silenceIncidents(i []*pagerduty.Incident, u []*pagerduty.User) tea.Cmd {
 
 //lint:ignore U1000 - future proofing
 type addIncidentNoteMsg string
-type waitForSelectedIncidentsThenAnnotateMsg string
 type addedIncidentNoteMsg struct {
 	note *pagerduty.IncidentNote
 	err  error
 }
 
 func addNoteToIncident(p *pd.Config, incident *pagerduty.Incident, content *os.File) tea.Cmd {
-	debug("addNoteToIncident")
 	return func() tea.Msg {
 		defer content.Close()
 
@@ -356,13 +419,17 @@ func addNoteToIncident(p *pd.Config, incident *pagerduty.Incident, content *os.F
 			return errMsg{err}
 		}
 
-		n, err := pd.PostNote(p.Client, incident.ID, u, content)
-		return addedIncidentNoteMsg{n, err}
+		if content != "" {
+			n, err := pd.PostNote(p.Client, incident.ID, u, content)
+			return addedIncidentNoteMsg{n, err}
+		}
+
+		return addedIncidentNoteMsg{nil, errors.New(nilNoteErr)}
 	}
 }
 
+// getTeamsAsStrings returns a slice of team IDs as strings from the []*pagerduty.Teams in a *pd.Config
 func getTeamsAsStrings(p *pd.Config) []string {
-	debug("getTeamsAsStrings")
 	var teams []string
 	for _, t := range p.Teams {
 		teams = append(teams, t.ID)
@@ -371,25 +438,40 @@ func getTeamsAsStrings(p *pd.Config) []string {
 }
 
 func getDetailFieldFromAlert(f string, a pagerduty.IncidentAlert) string {
-	debug("getDetailFieldFromAlert")
 	if a.Body["details"] != nil {
 
 		if a.Body["details"].(map[string]interface{})[f] != nil {
 			return a.Body["details"].(map[string]interface{})[f].(string)
 		}
-		debug(fmt.Sprintf("alert body \"details\" does not contain field %s", f))
+		debug(fmt.Sprintf("tui.getDetailFieldFromAlert(): alert body \"details\" does not contain field %s", f))
 		return ""
 	}
-	debug("alert body \"details\" is nil")
+	debug("tui.getDetailFieldFromAlert(): alert body \"details\" is nil")
 	return ""
 }
 
 // acknowledged returns "A" for "acknowledged" if the incident has been acknowledged, or a dot for "triggered" otherwise
 func acknowledged(a []pagerduty.Acknowledgement) string {
-	debug("acknowledged")
 	if len(a) > 0 {
 		return "A"
 	}
 
 	return dot
+}
+
+func doIfIncidentSelected(m *model, cmd tea.Cmd) tea.Cmd {
+	debug("doIfIncidentSelected()")
+	if m.table.SelectedRow() == nil {
+		debug("doIfIncidentSelected(): selected row is nil")
+		m.setStatus(nilIncidentErr)
+		m.viewingIncident = false
+		return tea.Sequence(
+			func() tea.Msg { return errMsg{errors.New(nilIncidentErr)} },
+		)
+	}
+	debug("doIfIncidentSelected(): got selected row")
+	return tea.Sequence(
+		func() tea.Msg { return getIncidentMsg(m.table.SelectedRow()[1]) },
+		cmd,
+	)
 }
