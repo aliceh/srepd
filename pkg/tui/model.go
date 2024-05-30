@@ -2,7 +2,6 @@ package tui
 
 import (
 	"fmt"
-	"log"
 
 	"github.com/PagerDuty/go-pagerduty"
 	"github.com/charmbracelet/bubbles/help"
@@ -10,7 +9,9 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/clcollins/srepd/pkg/launcher"
 	"github.com/clcollins/srepd/pkg/pd"
+	"github.com/charmbracelet/log"
 )
 
 type model struct {
@@ -18,7 +19,7 @@ type model struct {
 
 	config   *pd.Config
 	editor   []string
-	launcher ClusterLauncher
+	launcher launcher.ClusterLauncher
 
 	table table.Model
 	input textinput.Model
@@ -38,20 +39,14 @@ type model struct {
 }
 
 func InitialModel(
-	// "d" is to avoid a conflict with the "debug" function
-	d bool,
 	token string,
 	teams []string,
 	user string,
 	ignoredusers []string,
 	editor []string,
-	launcher ClusterLauncher,
+	launcher launcher.ClusterLauncher,
 ) (tea.Model, tea.Cmd) {
-	if d {
-		debugLogging = true
-	}
-
-	debug("InitialModel")
+	log.Debug("InitialModel")
 	var err error
 
 	m := model{
@@ -86,7 +81,7 @@ func (m *model) setStatus(msg string) {
 	d = append(d, "setStatus")
 	d = append(d, msg)
 
-	log.Printf("%s\n", d)
+	log.Infof("%s", d)
 }
 
 func (m *model) toggleHelp() {
@@ -94,14 +89,14 @@ func (m *model) toggleHelp() {
 }
 
 func newTableWithStyles() table.Model {
-	debug("newTableWithStyles")
+	log.Debug("newTableWithStyles")
 	t := table.New(table.WithFocused(true))
 	t.SetStyles(tableStyle)
 	return t
 }
 
 func newTextInput() textinput.Model {
-	debug("newTextInput")
+	log.Debug("newTextInput")
 	i := textinput.New()
 	i.Prompt = " $ "
 	i.CharLimit = 32
@@ -110,14 +105,14 @@ func newTextInput() textinput.Model {
 }
 
 func newHelp() help.Model {
-	debug("newHelp")
+	log.Debug("newHelp")
 	h := help.New()
 	h.ShowAll = true
 	return h
 }
 
 func newIncidentViewer() viewport.Model {
-	debug("newIncidentViewer")
+	log.Debug("newIncidentViewer")
 	vp := viewport.New(100, 100)
 	vp.Style = incidentViewerStyle
 	return vp
